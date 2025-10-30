@@ -1,0 +1,2060 @@
+
+
+var AOI = ee.FeatureCollection("projects/ee-idcossa/assets/NMB")
+var trainingData = ee.FeatureCollection("projects/ee-idrshandu/assets/LULC_ClassificationApproach/NMB-Poly-2-2020");    // Polygons
+//Map.addLayer(trainingData, {}, 'Training Data');
+//var trainingPoints = ee.FeatureCollection("projects/ee-idrshandu/assets/June2022_lulc_point_5_nmb"); // Points
+
+// Seeting Working Map
+Map.centerObject(AOI, 10)
+Map.addLayer(AOI, {}, 'Study Area', false)
+
+//Study Area = km.square
+var StudyArea = AOI.geometry().area().divide(1e6).round()
+print('AOI Area: km.square', StudyArea)
+//var baseChange =  [{featureType: 'all', stylers: [{saturation: -100}, {lightness: 45}]}];
+//Map.setOptions('baseChange', {'baseChange': baseChange}); - BaseMap
+
+// Defining visualisation
+var trueC = {
+  bands: ['Red', 'Green', 'Blue'],
+  min: 0.03,
+  max: 0.17,
+};
+var falseC = {
+  bands: ['NIR', 'Red', 'Green'],
+  min: 0.02,
+  max: 0.34,
+};
+
+var landCoverPalette = {min:0, max:6, palette: [
+    '0000FF',   // water
+    '006400',   
+    '#fa0000', 
+    '#06cd28',
+    '#9ea3a1', 
+    '#ffff4c',
+    '#0096a0',
+    //'black'
+]};
+
+
+var startDate = '2020-08-01';
+var endDate = '2020-09-30';
+
+
+//============================================================================================================
+//                                          Calling Images
+//============================================================================================================
+
+var imageS = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+    .filterBounds(AOI)
+    .filter(ee.Filter.date(startDate, endDate))
+    .sort('CLOUDY_PIXEL_PERCENTAGE')
+  
+print("Satellite Images Collection", imageS) 
+
+
+//                                     Rename bands and rescale
+//============================================================================================================
+
+// Function to preprocess Sentinel-2
+function preprocessSentinel2(image) {
+    // Cloud masking using QA60 band (cloud and cirrus bits)
+    var qa = image.select('QA60');
+    var cloudBitMask = 1 << 10; // Bit 10: clouds
+    var cirrusBitMask = 1 << 11; // Bit 11: cirrus
+    var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+                 .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+
+    // Scale optical bands (Sentinel-2 reflectance is originally between 0-10000)
+    var opticalBands = image
+            .select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+            .divide(10000); //Scaling optical bands to reflectance (0–1)
+
+    // Update the image with scaled bands and apply mask
+    return image.addBands(opticalBands, null, true)
+                .updateMask(mask);
+}
+
+// Apply preprocessing
+var processedCollection = imageS.map(preprocessSentinel2);
+
+// Function to rename Sentinel-2 bands
+function renameBands(image) {
+    return image.select(['B2', 'B3', 'B4', 'B8', 'B11', 'B12'])
+                .rename(['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2']);
+}
+
+// Rename bands and make a median composite
+var imageCollection = processedCollection.map(renameBands)
+    .median()
+    //.first()
+    .clip(AOI);
+    
+
+//var lndsat5Image_1985 = lndsat5_85.median().clip(AOI)
+Map.addLayer(imageCollection, falseC, 'False colour', false);
+Map.addLayer(imageCollection, trueC,'True Colour', false);
+
+
+//                                    Index Calculation
+//============================================================================================================
+
+// Upsampling - resampling to 10 resolution - S2
+var crs = 'EPSG:4326'; 
+var scale = 10;
+
+function resampleBandsAndProject(image, scale) {
+  return image.resample('bilinear').reproject({
+    crs: crs, // Use the globally defined CRS
+    scale: scale
+  });
+}
+
+
+// Defining Bands for Other Index || can use function below or normal calculations
+var Blue = imageCollection.select("Blue");
+var Green = imageCollection.select("Green");
+var NIR = imageCollection.select("NIR");
+var Red = imageCollection.select("Red");
+var SWIR1 = imageCollection.select("SWIR1"); 
+var SWIR2 = imageCollection.select("SWIR2")
+
+
+
+
+var NDWI = imageCollection.normalizedDifference(["Green","NIR"]).rename("NDWI");  // NDWI
+var MNDWI= imageCollection.normalizedDifference(["Blue","SWIR1"]).rename("MNDWI"); // MNDWI
+var NDVI = imageCollection.normalizedDifference(["NIR","Red"]).rename("NDVI");     // NDVI
+var WRI = Green.add(Red).divide(NIR.add(SWIR1)).rename("WRI");                     // WRI
+var NDBI = SWIR1.subtract(NIR).divide(NIR.add(SWIR1)).rename("NDBI")               // Built-Up or urban Index
+var NDMI = imageCollection.normalizedDifference(["NIR", "SWIR1"]).rename("NDMI")   // Moisture 
+
+var IBI = NDBI.subtract((NDVI.add(MNDWI)).divide(2)).divide(NDBI.add((NDVI         // Index-Based Built-up (combo index) using NDVI, MNDVI, NDBI
+          .add(MNDWI)).divide(2))).rename('IBI');                               
+// IBI - enhance detection of built-up, aim to differentiate between built-up, water and vege. by combining their charcateristics
+// higher value close to 1 corrspond to urban || lower values correspond to non-urban (veg. and water)
+
+var BSI = imageCollection.expression(
+    '(( X + Y ) - (A + B)) /(( X + Y ) + (A + B)) ', {
+      'X': SWIR1, 
+      'Y': Red,  
+      'A': NIR, 
+      'B': Blue, 
+    })
+    .rename('BSI');   // Bare Soil Index
+    
+var EVI = imageCollection.expression(
+  '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+    'NIR': NIR,
+    'RED': Red,
+    'BLUE': Blue
+  }).rename('EVI');  // Enhanced vegetation Index - sensitive in biomes
+  
+var AWEI_nsh = imageCollection.expression(
+    'Blue + 2.5 * Green - 1.5 * (NIR + SWIR1) - 0.25 * SWIR2', {
+    'Blue': Blue,
+    'Green': Green,
+    'NIR': NIR,
+    'SWIR1': SWIR1,
+    'SWIR2': SWIR2
+}).rename('AWEI_nsh');  // Automatic-Water Extraction - For Shadow Areas (There is other for genral water)
+ 
+ 
+// Nomrmalising the IBI ?????
+var IBI_normalized = IBI.unitScale(-1, 1); // Normalize to a 0-1 range
+
+var OSAVI = imageCollection.expression(  // Optimised Soil Adjusted Vegetation Index
+  '(NIR - Red) / (NIR + Red + 0.16)', {
+     'NIR': NIR,
+     'Red': Red,
+    }
+  ).rename('OSAVI')
+
+var GCVI = imageCollection.expression(  // Green Chlorophyll Vegetation Index 
+  '(NIR / Green) - 1', {
+    'NIR': NIR,
+    'Green': Green
+    }
+  ).rename('GCVI')
+
+
+
+
+//                                     Visualising Index  
+//============================================================================================================          
+
+var indexVis = {
+  NDWI: {min: -0.29, max: 0.07, palette: ['brown', 'white', 'blue']},
+  MNDWI: {min: -0.2, max: 0.08, palette: ['purple', 'white', 'blue']},
+  WRI: {min: 0.63, max: 1.09, palette: ['white', 'yellow', 'blue']},
+  NDVI: {min: -0.01, max: 0.37, palette: ['brown', 'white', 'green']},
+  IBI: {min: -1.00, max: 1.00, palette: ['gray', 'yellow', 'green']},
+  NDBI: {min: -0.2, max: 0.03, palette: ['green', 'white', 'brown']},
+  NDMI: {min: -0.2, max: 0.03, palette: ['blue','yellow','green','darkgreen','black']},
+  BSI: {min: -0.51, max: 0.16, palette: ['green', 'blue', 'white', 'orange']},
+  EVI: {min: -0.24, max: 1.39, palette: ['brown', 'white', 'green']},
+  AWEI_nsh: {min: -2.3, max: 0.57, palette: ['blue', 'white', 'cyan']},
+  OSAVI: {min:-0.103, max:0.59, palette:['blue', 'yellow', 'green']},
+  GCVI: {min:-0.886, max:10.33, palette:['blue', 'yellow', 'green']},
+};
+ 
+//Map.addLayer(NDWI, indexVis.NDWI, "NDWI",false);
+//Map.addLayer(MNDWI, indexVis.MNDWI, "MNDWI",false);
+//Map.addLayer(WRI, indexVis.WRI, "WRI",false);
+//Map.addLayer(NDVI, indexVis.NDVI, "NDVI",false);
+//Map.addLayer(IBI, indexVis.IBI, "IBI",false);
+//Map.addLayer(NDBI, indexVis.NDBI, "NDBI",false);
+//Map.addLayer(NDMI, indexVis.NDMI, "NDMI",false);
+//Map.addLayer(BSI, indexVis.BSI, "BSI",false);
+//Map.addLayer(EVI, indexVis.EVI, "EVI",false);
+//Map.addLayer(AWEI_nsh, indexVis.AWEI_nsh, "AWEI_nsh",false);
+
+
+
+//===============================================================================================================================
+//                                 Auxillary Dataset - Variables Processed Arc
+//==============================================================================================================================
+
+
+// SRTM DEM
+var srtm = ee.Image('USGS/SRTMGL1_003').clip(AOI);
+var elevationSRTM = srtm.select('elevation'); // Elevation
+var slopeSRTM = ee.Terrain.slope(srtm);       // Derive Slope
+var aspectSRTM = ee.Terrain.aspect(srtm);     // Derive Aspect
+
+
+var distToRailSt = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/railwayStationEuc_nmb').clip(AOI);
+var distToRailWay = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/railwaysEuc_nmb').clip(AOI);
+var distToRiver = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/riversEuc_nmb').clip(AOI);
+var distToRoad = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/roadsEuc_nmb').clip(AOI);
+var distToWater = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/waterPerEuc_nmb').clip(AOI);
+var distToTown = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/townEuc_nmb').clip(AOI);
+var slope = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/slope_nmb_contour').clip(AOI);
+var elevation = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/elevation_nmb').clip(AOI);
+var aspect = ee.Image('projects/ee-idrshandu/assets/nmb_lulcDrivers/aspect_nmb_contour').clip(AOI);
+
+
+// Compute HAND using distance from stream and elevation difference
+var hand2 = elevation.subtract(elevation.reduceNeighborhood({
+  reducer: ee.Reducer.min(),
+  kernel: ee.Kernel.circle(1),
+  skipMasked: true
+}));
+
+
+var computeTPI = function(elevation) {
+  var neighborhoodMean = elevation.focal_mean({
+    radius: 500,
+    units: 'meters',
+    kernelType: 'circle'
+  });
+  var tpi = elevation.subtract(neighborhoodMean).rename('TPI');
+  return tpi;
+};
+var tpi = computeTPI(elevation);
+
+
+//                                         GHSL: DataSet 1975-2030 (P2023A)
+//===================================================================================================================
+
+
+// population_count 
+// This raster dataset depicts the spatial distribution of residential population, 
+// expressed as the absolute number of inhabitants of the cell. Residential population estimates 
+// between 1975 and 2020 in 5-year intervals and projections to 2025 and 2030 derived from CIESIN GPWv4.1
+
+// BuiltUp data with Prediction (1975-2050)
+var builtUp = ee.Image("JRC/GHSL/P2023A/GHS_BUILT_S/2020")
+            .select('built_surface').clip(AOI);
+    
+var builtParams = {min: 0.0, max: 8000.0, palette: ['000000', 'FFFFFF']};
+//Map.addLayer(builtUp, builtParams, 'Built-up 2020', false);
+
+
+
+// ------------------------------K -Means Clustering
+
+var trainingk = imageCollection.sample({region: AOI, scale: 10, numPixels: 1000});
+var clusterer = ee.Clusterer.wekaKMeans(7).train(trainingk);
+var clustered = imageCollection.cluster(clusterer).rename('K-Means');
+Map.addLayer(clustered.randomVisualizer(), {}, 'kMeans Clusters', false);
+
+
+
+
+//                        Harmonizing the resolution ensures consistent pixel alignment across all         
+//=============================================================================================================================
+
+
+//  Apply function
+elevation = resampleBandsAndProject(elevation, scale, AOI);
+slope = resampleBandsAndProject(slope, scale, AOI);
+aspect = resampleBandsAndProject(aspect, scale, AOI);
+hand2 = resampleBandsAndProject(hand2, scale, AOI);
+
+distToWater = resampleBandsAndProject(distToWater, scale, AOI);
+distToRiver = resampleBandsAndProject(distToRiver, scale, AOI);
+distToRoad = resampleBandsAndProject(distToRoad, scale, AOI);
+distToRailSt = resampleBandsAndProject(distToRailSt, scale, AOI);
+distToTown = resampleBandsAndProject(distToTown, scale, AOI);
+
+builtUp = resampleBandsAndProject(builtUp, scale, AOI);
+tpi = resampleBandsAndProject(tpi, scale, AOI);
+
+
+//Map.addLayer(tpi, {}, 'TPI', false);
+
+
+//=============================================================================================================================
+//                                      Stack Bands Drivers 
+//=============================================================================================================================
+
+
+// Combine all ancillary bands into one image
+var predictors = elevation.select(0).rename('Elevation')
+            .addBands(slope.rename('Slope'))
+            .addBands(aspect.rename('Aspect'))
+            .addBands(hand2.select(0).rename('HAND'))
+            .addBands(tpi.rename('TPI'))
+            .addBands(distToWater.rename('Distance from Water'))
+            .addBands(distToRiver.rename('Distance from Rivers'))
+            .addBands(distToRoad.rename('Distance from Road'))
+            .addBands(distToRailSt.rename('Distance from RailStation'))
+            .addBands(distToTown.rename('Distance from Town'))
+            .addBands(builtUp.rename('GHSL Built-up'))
+            .addBands(clustered);
+print('Ancillary Data:',predictors );
+
+
+//============================================================================================================
+//                            Adding Index to Image Collection - with k-means
+//============================================================================================================
+
+var combinedImage = imageCollection.addBands(NDWI).addBands(MNDWI).addBands(WRI).addBands(NDVI)
+        .addBands(NDBI).addBands(BSI).addBands(EVI).addBands(AWEI_nsh).addBands(NDMI).addBands(IBI)
+        .addBands(OSAVI).addBands(GCVI).addBands(predictors)
+print('Combined Image Bands:', combinedImage);
+
+
+
+//                               Normalising and Scalling (Standardised in not mandotory for RF)
+//=============================================================================================================================
+
+/*
+// Function to normalize an image using min-max scaling
+function normalizeImage(image, AOI, scale) {
+  var minMax = image.reduceRegion({
+    reducer: ee.Reducer.minMax(),
+    geometry: AOI,
+    scale: 10,
+    maxPixels: 1e13
+  });
+
+  var min = ee.Number(minMax.values().get(0));
+  var max = ee.Number(minMax.values().get(1));
+  
+  // Avoid divide-by-zero if min == max
+  var normalized = image.subtract(min).divide(max.subtract(min));
+  
+  return normalized.rename(image.bandNames());
+}
+
+// Normalize each image
+var combinedImage = normalizeImage(combinedImageRaw, AOI, scale);
+*/
+
+
+//============================================================================================================
+//                                     Prepare ML- Model Model
+//============================================================================================================
+
+// SANLC 2020 Dataset
+var dict = {"names": ["Contiguous (indigenous) Forest (combined very high, high, medium)", "Contiguous Low Forest & Thicket (combined classes)", "Dense Forest & Woodland (35 - 75% cc)", "Open Woodland (10 - 35% cc)", "Contiguous & Dense Planted Forest (combined classes)", "Open & Sparse Planted Forest", "Temporary Unplanted Forest", "Low Shrubland (other regions)", "Low Shrubland (Fynbos)", "Low Shrubland (Succulent Karoo)", "Low Shrubland (Nama Karoo)", "Sparsely Wooded Grassland (5 - 10% cc)", "Natural Grassland", "Natural Rivers", "Natural Estuaries & Lagoons", "Natural Ocean, Coastal", "Natural Lakes", "Natural Pans (flooded @ obsv time)", "Artificial Dams (incl. canals)", "Artificial Sewage Ponds", "Artificial Flooded Mine Pits", "Herbaceous Wetlands (currently mapped)", "Herbaceous Wetlands (previous mapped extent)", "Mangrove Wetlands", "Natural Rock Surfaces", "Dry Pans", "Eroded Lands", "Sand Dunes (terrestrial)", "Coastal Sand Dunes & Beach Sand", "Bare Riverbed Material", "Other Bare", "Cultivated Commercial Permanent Orchards", "Cultivated Commercial Permanent Vines", "Cultivated Commercial Sugarcane Pivot Irrigated", "Commercial Permanent Pineapples", "Cultivated Commercial Sugarcane Non-Pivot (all other)", "Cultivated Emerging Farmer Sugarcane Non-Pivot (all other)", "Commercial Annuals Pivot Irrigated", "Commercial Annuals Non-Pivot Irrigated", "Commercial Annuals Crops Rain-Fed / Dryland / Non-Irrigated", "Subsistence / Small-Scale Annual Crops", "Fallow Land & Old Fields (Trees)", "Fallow Land & Old Fields (Bush)", "Fallow Land & Old Fields (Grass)", "Fallow Land & Old Fields (Bare)", "Fallow Land & Old Fields (Low Shrub)", "Residential Formal (Tree)", "Residential Formal (Bush)", "Residential Formal (low veg / grass)", "Residential Formal (Bare)", "Residential Informal (Tree)", "Residential Informal (Bush)", "Residential Informal (low veg / grass)", "Residential Informal (Bare)", "Village Scattered (bare only)", "Village Dense (bare only)", "Smallholdings (Tree)", "Smallholdings (Bush)", "Smallholdings (low veg / grass)", "Smallholdings (Bare)", "Urban Recreational Fields (Tree)", "Urban Recreational Fields (Bush)", "Urban Recreational Fields (Grass)", "Urban Recreational Fields (Bare)", "Commercial", "Industrial", "Roads & Rail (Major Linear)", "Mines: Surface Infrastructure", "Mines: Extraction Sites: Open Cast & Quarries combined", "Mines: Extraction Sites: Salt Mines", "Mines: Waste (Tailings) & Resource Dumps", "Land-fills", "Fallow Land & Old Fields (wetlands)"], "colors": ["#F2F2F2", "#065106", "#005F00", "#008500", "#F74006", "#F9764D", "#F9906C", "#B8ABD1", "#8FAB39", "#AC92C5", "#AC9CDA", "#85D285", "#D2B485", "#00009F", "#041FA7", "#0639AB", "#0D50AC", "#125FAC", "#1373B4", "#1D81B6", "#1F8EB8", "#06DEDC", "#06E0D0", "#9F1FEC", "#ffffe0", "#DCDAC5", "#F9E0E0", "#F9F9C5", "#F9F9A7", "#CDD2E0", "#ffffe0", "#A62C39", "#B31F5C", "#DB0000", "#9F3978", "#FF0000", "#F64D6C", "#381A12", "#521F1C", "#85402C", "#C5735F", "#C1436C", "#C55E82", "#D27592", "#E0AAB8", "#DB90A9", "#ECDB0F", "#F6EC13", "#F9F81F", "#FFFF29", "#EC82EC", "#F691E0", "#F99FCF", "#FFC5CF", "#ECC500", "#FFD91F", "#AC7879", "#B89192", "#C49C9E", "#D2B8B8", "#BFFF00", "#33FF33", "#66FF66", "#99FF99", "#C49F0D", "#8F8506", "#F9DD03", "#FFFF00", "#B30606", "#C50606", "#D21D1A", "#F95479", "#6CE7DC"]}
+var sa_nlc_2020 = ee.Image('projects/sat-io/open-datasets/landcover/SA_NLC_2020');
+var nmb_SANLC = sa_nlc_2020.clip(AOI);
+
+// Upload Reclassified SANLC for Study Area
+// Reclassify SANLC to our map    => //var reclassImage = nmb_SANLC.remap([0,1,2,3,4,5,6],[1,2,3,4,5,6,7])
+    // MyClass 1 (does not have wetland)  AND MyClass 2 (has wetland)
+var nmbNlc_20Reclas = ee.Image('projects/ee-idrshandu/assets/LULC_ClassificationApproach/NMBSAMyClas2').clip(AOI);   // MyClass 1 or 2
+var nmbGobal_20Reclas = ee.Image('projects/ee-idrshandu/assets/LULC_ClassificationApproach/NMBGBLMyClas2').clip(AOI);
+print('Reclassified NMB SANLC', nmbNlc_20Reclas)
+print('Reclassified NMB GLOBAL', nmbGobal_20Reclas)
+
+Map.addLayer(nmbNlc_20Reclas, landCoverPalette, 'SA-LULC 2020 Reclass', false )
+Map.addLayer(nmbGobal_20Reclas, landCoverPalette, 'Global-LULC 2020 Reclass', false )
+
+
+// ESRI LULC = https://gee-community-catalog.org/projects/S2TSLULC/#class-definitions
+//var esri_lulc_ts= ee.ImageCollection("projects/sat-io/open-datasets/landcover/ESRI_Global-LULC_10m_TS");
+
+var esriNmb_2020 = ee.Image('projects/ee-idrshandu/assets/ESRI_LULC_nmb_Rec').clip(AOI);
+Map.addLayer(esriNmb_2020, landCoverPalette, 'ESRI-LULC 2020', false )
+
+
+//============================================================================================================
+//                                      Working with Polygongs from Google earth pro
+//============================================================================================================
+
+print('🟢 Training and Validation Generation')
+
+//Map.addLayer(trainingData, {}, "Training Polygon", false)
+
+
+// Defining training and testing set = seelct option
+  // trainingPoints from GEE                                                = Option 0
+  // trainingPoints from Google Earth Pro                                   = Option 1
+  // trainingPoints random point from polygon (no need for buffer)          = Option 2
+  // trainingPoints buffer from either GEE or GEP or any point              = Option 3
+        // buffer any of the points of collection (3.1 or 3.2)                                                                
+
+//=============================================== OPTION 0 =================================================
+/*
+waterPoint = water20; forestPoint = forest20; built_upPoint = built_up20; 
+wetlandPoint = wetland20; croplandPoint = cropland20; barrenPoint = barren20; grasslandPoint = grassland20; 
+var minesPoint = mines20
+
+// Merging Training Features/Samples (Point generated from GEE)
+var trainingPoints = waterPoint.merge(forestPoint).merge(built_upPoint).merge(wetlandPoint)
+                    .merge(croplandPoint).merge(barrenPoint).merge(grasslandPoint).merge(minesPoint)
+//print('Class Names:', classNames)
+*/
+
+//=============================================== OPTION 1 =================================================
+
+// Using training point from Google Earth Pro or Polygongs
+//var trainingPoints = trainingPointGEP;    // TrainingPoints
+//var trainingPoints = trainingData;
+
+//=============================================== OPTION 2 =================================================
+
+// Generte Point From Polygons which were derived from GEP
+
+// Number of point per polygons
+var pointsPerPolygons  = 15;
+
+// Function to genrate random points
+var generatePoints = function(feature) {
+  var classValue = feature.get('class'); // Get class label
+  var region = feature.geometry();
+
+  // Generate random points
+  var randomPoints = ee.FeatureCollection.randomPoints({
+    region: region,
+    points: pointsPerPolygons,
+    seed: 42, // Optional: for reproducibility
+  });
+
+  // Set the class property to each point
+  return randomPoints.map(function(pt) {
+    return pt.set('class', classValue);
+  });
+};
+
+// Apply the function to all polygons
+var trainingPoints = trainingData.map(generatePoints).flatten();
+
+// Print and visualize
+print('Generated Training Points =', trainingPoints.size());
+//Map.addLayer(trainingPoints, {color: 'red'}, 'Random Training Points');
+
+
+
+
+//                                    Signature plot from the polygon points above
+//============================================================================================================
+
+/*
+var waterPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 0));
+var forestPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 1));
+var built_upPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 2));
+var croplandPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 3));
+var barrenPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 4));
+var grasslandPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 5));
+var wetlandPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 6));
+//var minesPolyPoint = trainingPoints.filter(ee.Filter.eq('class', 7));
+
+
+// Merging all individuals
+waterPolyPoint = waterPolyPoint.union()
+forestPolyPoint = forestPolyPoint.union()
+built_upPolyPoint = built_upPolyPoint.union()
+croplandPolyPoint = croplandPolyPoint.union()
+barrenPolyPoint = barrenPolyPoint.union()
+grasslandPolyPoint = grasslandPolyPoint.union()
+wetlandPolyPoint = wetlandPolyPoint.union()
+//minesPolyPoint = minesPolyPoint.union()
+
+// Assign class names as a property for each feature
+waterPolyPoint = waterPolyPoint.map(function(feature) { return feature.set('class', 'water'); });
+forestPolyPoint = forestPolyPoint.map(function(feature) { return feature.set('class', 'forest'); });
+built_upPolyPoint = built_upPolyPoint.map(function(feature) { return feature.set('class', 'built_up'); });
+croplandPolyPoint = croplandPolyPoint.map(function(feature) { return feature.set('class', 'cropland'); });
+barrenPolyPoint = barrenPolyPoint.map(function(feature) { return feature.set('class', 'barren'); });
+grasslandPolyPoint = grasslandPolyPoint.map(function(feature) { return feature.set('class', 'grassland'); });
+wetlandPolyPoint = wetlandPolyPoint.map(function(feature) { return feature.set('class', 'wetland'); });
+//minesPolyPoint = minesPolyPoint.map(function(feature) { return feature.set('class', 'mines'); });
+
+// Signaures
+var sigClassNamesPolyPoint = waterPolyPoint.merge(forestPolyPoint).merge(built_upPolyPoint)
+                .merge(croplandPolyPoint).merge(barrenPolyPoint).merge(grasslandPolyPoint).merge(wetlandPolyPoint)//.merge(minesPolyPoint)
+
+
+// Divide bands for Scenarios
+    // Bands = 'Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2'
+    // Indices = 'MNDWI',, 'IBI' 'NDWI', 'MNDWI','WRI', 'NDVI', 'NDBI', 'BSI', 'EVI', 'AWEI_nsh', 'NDMI', 'IBI'
+    // Auxiliary = // 'HAND','IBI', 'Elevation', 'Slope', 'HAND','DistToWater', 'DistToRivers','NighTimeLight', //  'DistToRailStation', 'DistToTown', 
+                  // 'GlobalPopulation', 'GlobalBuiltUp', 'DistToRoad',
+var sigClassBandsSc1 = combinedImage.select('Red', 'Green', 'Blue', 'NIR', 'SWIR1', 'SWIR2'); 
+var sigClassBandsSc2 = combinedImage.select('MNDWI', 'IBI' ,'NDWI', 'WRI', 'NDVI', 'NDBI', 'BSI', 'EVI', 'AWEI_nsh', 'NDMI'); 
+var sigClassBandsSc3 = combinedImage.select('Elevation', 'Slope','Aspect', 'DistToWater', 'DistToRivers',  'DistToRoad', 'DistToRailStation','DistToTown',   'GlobalBuiltUp'); 
+
+
+
+// Create the scatter chart - to show pixels
+var Scatter1 = ui.Chart.image.regions(
+    sigClassBandsSc1, sigClassNamesPolyPoint, ee.Reducer.mean(), 10, 'class') 
+        .setChartType('ScatterChart')
+        .setOptions({
+          title: 'Bands: Surface Reflectance Spectra',
+          titlePosition: {position:'center'},
+          hAxis: {title: 'Wavelength Bands'},
+          vAxis: {title: 'Reflectance'},
+          lineWidth: 3,
+          pointSize: 5,
+          titleTextStyle: {bold: true, fontSize: 14},
+          series: { // Other method will be defining and extracting from colelction
+            0: {color: '0000FF', label: 'Water'},     // Water (blue)
+            1: {color: '006400', label: 'Forest'},    // Forest (dark green)
+            2: {color: '#fa0000', label: 'Built-Up'}, // Built-up (red)
+            3: {color: '#06cd28', label: 'Cropland'}, // Cultivated (golden yellow)
+            4: {color: '#9ea3a1', label: 'Barren'},   // Barren (tan)
+            5: {color: '#ffff4c', label: 'Grassland'}, // grassland ()
+            6: {color: '#0096a0', label: 'Wetland'},  // Wetland ()
+           // 7: {color: 'black', label: 'Mines and Quarry'} // mines ()
+          }});
+  print(Scatter1);
+
+// Create the scatter chart - to show pixels
+var Scatter2 = ui.Chart.image.regions(
+    sigClassBandsSc2, sigClassNamesPolyPoint, ee.Reducer.mean(), 10, 'class') 
+        .setChartType('ScatterChart')
+        .setOptions({
+          title: 'Bands: Surface Reflectance Spectra',
+          titlePosition: {position:'center'},
+          hAxis: {title: 'Wavelength Bands'},
+          vAxis: {title: 'Reflectance'},
+          lineWidth: 3,
+          pointSize: 5,
+          titleTextStyle: {bold: true, fontSize: 14},
+          series: { // Other method will be defining and extracting from colelction
+            0: {color: '0000FF', label: 'Water'},     // Water (blue)
+            1: {color: '006400', label: 'Forest'},    // Forest (dark green)
+            2: {color: '#fa0000', label: 'Built-Up'}, // Built-up (red)
+            3: {color: '#06cd28', label: 'Cropland'}, // Cultivated (golden yellow)
+            4: {color: '#9ea3a1', label: 'Barren'},   // Barren (tan)
+            5: {color: '#ffff4c', label: 'Grassland'}, // grassland ()
+            6: {color: '#0096a0', label: 'Wetland'},  // Wetland ()
+           // 7: {color: 'black', label: 'Mines and Quarry'} // mines ()
+          }});
+  print(Scatter2);
+  
+// Create the scatter chart - to show pixels
+var Scatter3 = ui.Chart.image.regions(
+    sigClassBandsSc3, sigClassNamesPolyPoint, ee.Reducer.mean(), 10, 'class') 
+        .setChartType('ScatterChart')
+        .setOptions({
+          title: 'Bands: Surface Reflectance Spectra',
+          titlePosition: {position:'center'},
+          hAxis: {title: 'Wavelength Bands'},
+          vAxis: {title: 'Reflectance'},
+          lineWidth: 3,
+          pointSize: 5,
+          titleTextStyle: {bold: true, fontSize: 14},
+          series: { // Other method will be defining and extracting from colelction
+            0: {color: '0000FF', label: 'Water'},     // Water (blue)
+            1: {color: '006400', label: 'Forest'},    // Forest (dark green)
+            2: {color: '#fa0000', label: 'Built-Up'}, // Built-up (red)
+            3: {color: '#06cd28', label: 'Cropland'}, // Cultivated (golden yellow)
+            4: {color: '#9ea3a1', label: 'Barren'},   // Barren (tan)
+            5: {color: '#ffff4c', label: 'Grassland'}, // grassland ()
+            6: {color: '#0096a0', label: 'Wetland'},  // Wetland ()
+           // 7: {color: 'black', label: 'Mines and Quarry'} // mines ()
+          }});
+  print(Scatter3);
+
+*/
+
+//                                Get Coordinate for point to export data
+//============================================================================================================
+
+
+// Function to extract coordinates from each feature (useful for DL)
+var addCoordinates = function(feature) {
+    var coords = feature.geometry().coordinates();
+    var lon = coords.get(0); 
+    var lat = coords.get(1); 
+    return feature.set({'longitude': lon, 'latitude': lat});
+  };
+var trainingPoints = trainingPoints.map(addCoordinates);
+//var trainingPoints = trainingPoints.filter(ee.Filter.notNull(['geometry'])); // filter NULL out before sampling:
+
+
+//                                   Generate Sampling and Split ratio | can try k-folds
+//============================================================================================================
+print('🟢 Training and Validation Dataset')
+
+var bands = ['Blue', 'Green', 'Red', 'NIR',  'NDWI', 'MNDWI', 'SWIR1', 'SWIR2','TPI', 
+            'WRI', 'NDVI', 'NDBI', 'BSI', 'EVI', 'AWEI_nsh', 'NDMI', 'IBI', 'Elevation', 'Slope', 'Aspect', 
+            'Distance from Water', 'Distance from Rivers',  'Distance from Road', 'Distance from RailStation', 
+            'Distance from Town', 'GHSL Built-up',
+            'K-Means'] 
+
+// Overlay training data to image                     
+var sample = combinedImage.select(bands).sampleRegions({
+  collection: trainingPoints, 
+  properties: ['class'],    // 'longitude', 'latitude'- If lat/lon are specified
+  scale: 10,
+  geometries: true
+});
+
+//print('Spliting Samples =', sample.aggregate_count('.all'));
+
+
+// ==== Method 1: ==================== Random Hold-Out Validation
+
+//Training The Classifier - spliting data - 80/20
+//var withRandom = sample.randomColumn('random');
+//var trainRandom = withRandom.filter(ee.Filter.lt('random', 0.8));
+//var testRandom = withRandom.filter(ee.Filter.gte('random', 0.8));
+
+var withRandom = sample.randomColumn('random', 42);
+var trainRandom = withRandom.filter('random <= 0.7');
+var testRandom = withRandom.filter('random > 0.7'); //20%
+
+//print('Train Set N =', trainRandom.aggregate_count('.all'));
+//print('Test Set N =', testRandom.aggregate_count('.all'));
+
+
+// Create a dictionary of samples
+//var samplesTV = {
+ // 'trnSample_nmb': trainRandom,
+  //'valSample_nmb': testRandom,
+  //'trnValSample_nmb_Oct': withRandom
+//};
+
+// Helper function to create export tasks
+//Object.keys(samplesTV).forEach(function(key) {
+  //Export.table.toDrive({
+    //collection: samplesTV[key],
+    //description: 'nmb_' + key,
+    //folder: 'LULC_ClassificationApproach_Revised',
+    //fileNamePrefix: key,
+    //fileFormat: 'CSV'
+  //})
+//});
+
+/*
+
+// ==== Method 2: ==================== Spatial Cross-Validation
+// Ensure all geometries are in EPSG:4326
+var sampleXY = sample.map(function(f) {
+  var geom = f.geometry().transform('EPSG:4326', 1);
+  var coords = geom.coordinates();
+  return f.set('lon', coords.get(0)).set('lat', coords.get(1));
+});
+
+
+// Sopatial Block Cross-Validation - block-based
+
+// --------------------  Create Spatial Blocks ----------------
+// Define grid size (in degrees)
+var gridSize = 0.001; // roughly 0.1 = 10 km; 0.01 = 1km, 0.05 = 5km
+var samplesWithBlocks = sampleXY.map(function(f) {
+  var lon = ee.Number(f.get('lon'));
+  var lat = ee.Number(f.get('lat'));
+  var blockLon = lon.divide(gridSize).floor();
+  var blockLat = lat.divide(gridSize).floor();
+  var blockId = blockLon.multiply(10000).add(blockLat);
+  return f.set('block_id', blockId);
+});
+
+print('✅ Samples with block IDs example:', samplesWithBlocks.first());
+print('📊 Number of samples with block IDs:', samplesWithBlocks.size());
+print('📊 Unique blocks detected:', samplesWithBlocks.aggregate_array('block_id').distinct().size());
+
+
+// ==========================  CREATE FOLDS ==========================
+var nFolds = 5;
+var uniqueBlocks = samplesWithBlocks.aggregate_array('block_id').distinct();
+
+// Convert blocks to FeatureCollection with random value
+var blocksFC = ee.FeatureCollection(uniqueBlocks.map(function(block) {
+  return ee.Feature(null, {
+    'block_id': ee.Number(block),
+    'randVal': ee.Number.parse(ee.String(ee.Number(block).multiply(999999).sin())).abs()
+  });
+}));
+
+// Sort randomly by randVal and assign folds
+var sortedBlocks = blocksFC.sort('randVal');
+var blocksList = sortedBlocks.toList(sortedBlocks.size());
+
+var blocksWithFolds = ee.FeatureCollection(
+  ee.List.sequence(0, sortedBlocks.size().subtract(1)).map(function(i) {
+    var f = ee.Feature(blocksList.get(i));
+    var fold = ee.Number(i).mod(nFolds);
+    return f.set('fold', fold);
+  })
+);
+
+// Join fold IDs to samples
+var clusteredSamples = ee.FeatureCollection(samplesWithBlocks.map(function(f) {
+  var block = f.get('block_id');
+  var foldFeature = blocksWithFolds.filter(ee.Filter.eq('block_id', block)).first();
+  var foldId = ee.Algorithms.If(foldFeature, foldFeature.get('fold'), 0);
+  return f.set('fold', foldId);
+}));
+
+print('Fold distribution:', clusteredSamples.aggregate_histogram('fold'));
+
+var paramGrid = ee.List([
+  ee.Dictionary({ntrees: 50, mtry: 3, minLeaf: 1, bag: 0.5, maxNodes: 1000, seed: 7}),
+  ee.Dictionary({ntrees: 100, mtry: 5, minLeaf: 2, bag: 0.7, maxNodes: 500, seed: 7}),
+  ee.Dictionary({ntrees: 150, mtry: 4, minLeaf: 1, bag: 0.6, maxNodes: 500,seed: 7}),
+  ee.Dictionary({ntrees: 200, mtry: 6, minLeaf: 2, bag: 0.8, maxNodes: 500, seed: 7})
+]);
+
+//var paramGrid = ee.List([
+  //ee.Dictionary({ntrees: 50, mtry: 3, minLeaf: 1, maxNodes: 1000, bag: 0.5}),
+  //ee.Dictionary({ntrees: 100, mtry: 5, minLeaf: 2, maxNodes: 500, bag: 0.7}),
+  //ee.Dictionary({ntrees: 150, mtry: null, minLeaf: 1, maxNodes: 1000, bag: 0.6}),
+//]);
+
+
+// ==========================  F1 FUNCTION ==========================
+function computeF1(cm) {
+  var arr = cm.array();
+  var n = arr.length().get([0]);
+  var classes = ee.List.sequence(0, n.subtract(1));
+
+  function safeDiv(n, d) {
+    return ee.Number(ee.Algorithms.If(ee.Number(d).eq(0), 0, ee.Number(n).divide(d)));
+  }
+
+  var perClass = classes.map(function(i) {
+    i = ee.Number(i);
+    var TP = ee.Number(arr.get([i, i]));
+    var FP = ee.Number(classes.map(function(k){ return ee.Number(arr.get([k, i])); }).reduce(ee.Reducer.sum())).subtract(TP);
+    var FN = ee.Number(classes.map(function(k){ return ee.Number(arr.get([i, k])); }).reduce(ee.Reducer.sum())).subtract(TP);
+    var prec = safeDiv(TP, TP.add(FP));
+    var rec = safeDiv(TP, TP.add(FN));
+    var denom = prec.add(rec);
+    var f1 = ee.Number(ee.Algorithms.If(denom.eq(0), 0, prec.multiply(rec).multiply(2).divide(denom)));
+    return ee.Dictionary({class: i, precision: prec, recall: rec, F1: f1});
+  });
+
+  var f1List = ee.List(perClass).map(function(d){ return ee.Dictionary(d).get('F1'); });
+  var macroF1 = ee.Number(f1List.reduce(ee.Reducer.mean()));
+
+  var TP_all = ee.Number(classes.map(function(i){ return ee.Number(arr.get([i,i])); }).reduce(ee.Reducer.sum()));
+  var FP_all = ee.Number(classes.map(function(i){
+    var colSum = classes.map(function(k){ return ee.Number(arr.get([k,i])); }).reduce(ee.Reducer.sum());
+    return ee.Number(colSum).subtract(ee.Number(arr.get([i,i])));
+  }).reduce(ee.Reducer.sum()));
+  var FN_all = ee.Number(classes.map(function(i){
+    var rowSum = classes.map(function(k){ return ee.Number(arr.get([i,k])); }).reduce(ee.Reducer.sum());
+    return ee.Number(rowSum).subtract(ee.Number(arr.get([i,i])));
+  }).reduce(ee.Reducer.sum()));
+
+  var microP = safeDiv(TP_all, TP_all.add(FP_all));
+  var microR = safeDiv(TP_all, TP_all.add(FN_all));
+  var microF1 = safeDiv(microP.multiply(microR).multiply(2), microP.add(microR));
+
+  return ee.Dictionary({macroF1: macroF1, microF1: microF1, perClassF1: perClass});
+}
+
+// ==========================  FOLD LOOP ==========================
+var inputProps2 = ['Blue', 'Green', 'Red', 'NIR', 'SWIR1', 'SWIR2',
+  'NDWI', 'MNDWI', 'WRI', 'NDVI', 'NDBI', 'BSI', 'EVI', 'AWEI_nsh', 'NDMI', 'IBI', 'K-Means'];
+
+var inputProps3 = inputProps2.concat([
+  'Elevation', 'Slope', 'Aspect', 'TPI',
+  'Distance from Water', 'Distance from Rivers',
+  'Distance from Road', 'Distance from RailStation',
+  'Distance from Town', 'GHSL Built-up'
+]);
+
+var runFold = function(i, params) {
+  i = ee.Number(i);
+  params = ee.Dictionary(params);
+  var train = clusteredSamples.filter(ee.Filter.neq('fold', i));
+  var test = clusteredSamples.filter(ee.Filter.eq('fold', i));
+
+  var ntrees = params.get('ntrees');
+  var mtry = params.get('mtry');
+  var minLeaf = params.get('minLeaf');
+  var maxNodes = params.get('maxNodes');
+  var bag = params.get('bag');
+  var seed = params.get('seed')
+  
+  // Use parameterized RF models
+  var clf2 = ee.Classifier.smileRandomForest({
+    numberOfTrees: ntrees,
+    variablesPerSplit: mtry,
+    minLeafPopulation: minLeaf,
+    bagFraction: bag,
+    seed: seed
+  }).train(train, 'class', inputProps2);
+
+  var clf3 = ee.Classifier.smileRandomForest({
+    numberOfTrees: ntrees,
+    variablesPerSplit: mtry,
+    minLeafPopulation: minLeaf,
+    bagFraction: bag,
+    seed: seed
+  }).train(train, 'class', inputProps3);
+
+  // Validation
+  var val2 = test.classify(clf2);
+  var val3 = test.classify(clf3);
+
+  var cm2 = val2.errorMatrix('class', 'classification');
+  var cm3 = val3.errorMatrix('class', 'classification');
+
+  var f1_2 = computeF1(cm2);
+  var f1_3 = computeF1(cm3);
+  
+  var prevalence = test.aggregate_histogram('class');
+  
+  return ee.Dictionary({
+    fold: i,
+    OA2: cm2.accuracy(),
+    macroF1_2: f1_2.get('macroF1'),
+    microF1_2: f1_2.get('microF1'),
+    PA2: cm2.producersAccuracy(),
+    UA2: cm2.consumersAccuracy(),
+    
+    OA3: cm3.accuracy(),
+    macroF1_3: f1_3.get('macroF1'),
+    microF1_3: f1_3.get('microF1'),
+    PA3: cm3.producersAccuracy(),
+    UA3: cm3.consumersAccuracy(),
+    
+    prevalence: prevalence,
+    
+    perClassF1_2: f1_2.get('perClassF1'),
+    perClassF1_3: f1_3.get('perClassF1'),
+    
+    clf2: clf2.explain(),
+    clf3: clf3.explain()
+
+  });
+};
+
+
+// Function to run tuning for each parameter set
+var runParamSet = function(params){
+  params = ee.Dictionary(params);
+
+  // Run across folds
+  var foldResults = ee.List.sequence(0, nFolds - 1).map(function(i){
+    return runFold(i, params);
+  });
+
+  // Aggregate metrics across folds
+  var extractMetric = function(results, key) {
+    return ee.List(results).map(function(d){
+      return ee.Dictionary(d).get(key);
+    }).removeAll([null]);
+  };
+
+  var meanMacroF1_2 = extractMetric(foldResults, 'macroF1_2').reduce(ee.Reducer.mean());
+  var meanMacroF1_3 = extractMetric(foldResults, 'macroF1_3').reduce(ee.Reducer.mean());
+  
+  return ee.Dictionary({
+    params: params,
+    meanMacroF1_2: meanMacroF1_2,
+    meanMacroF1_3: meanMacroF1_3,
+    results: foldResults
+  });
+};
+
+// Run tuning across all parameter sets
+var tuningResults = paramGrid.map(runParamSet);
+
+
+var tuningModelsResults = ee.List(tuningResults);//.get(0);
+//print('List of Tuning Model Results', tuningModelsResults);
+
+//██████████████ ---------- Manual List Visualisation: Best for classifier2: Using meanMacro
+var bestClass2 = tuningModelsResults.get(2);
+var bestClass3 = tuningModelsResults.get(2);
+var bestParams2 = ee.Dictionary(bestClass2).get('params');
+var bestParams3 = ee.Dictionary(bestClass3).get('params');
+
+
+/*
+print('Best Tuned Classifier 2 of Tuning Model Results', bestClass2);
+print('Best Tuned Classifier 3 of Tuning Model Results', bestClass3);
+print(' ✅ MRF Config. Class 2 Parameters:', bestParams2);
+print(' ✅ MRF Config. Class 3 Parameters:', bestParams3);
+*/
+
+//========================== Select different configurations for class1 and 2 or use 1
+//----------- 1. Identifying Model and Results
+/*
+var bestParams2 = ee.Dictionary(bestClass2).get('params');
+var bestParams3 = ee.Dictionary(bestClass3).get('params');
+
+//print(' ✅ MRF Config. Class 2 Parameters:', bestParams2);
+//print(' ✅ MRF Config. Class 3 Parameters:', bestParams3);
+
+
+
+//████████████████████--------- 2 Set Manual Selection after inspection
+var bestParams = ee.Dictionary(tuningResults.get(2)).get('params'); // index 1 = second item
+//print('✅ Manually Selected RF Parameters:', bestParams);
+
+*/
+
+//======================= Compute Results for bestParams
+/*
+//----------- 
+var results = ee.List.sequence(0, nFolds - 1).map(function(i){
+  return runFold(i, bestParams);
+});
+print('📦 Spatial CV Results (Selected RF):', results);
+
+
+
+//--------------------------- Metric Extraction
+
+function extractMetric(results, key) {
+  return ee.List(results).map(function(d){ return ee.Dictionary(d).get(key); })
+           .removeAll([null]);
+}
+
+// Compute means safely
+var meanOA2 = extractMetric(results, 'OA2').reduce(ee.Reducer.mean());
+var meanOA3 = extractMetric(results, 'OA3').reduce(ee.Reducer.mean());
+var meanMacroF1_2 = extractMetric(results, 'macroF1_2').reduce(ee.Reducer.mean());
+var meanMacroF1_3 = extractMetric(results, 'macroF1_3').reduce(ee.Reducer.mean());
+var meanMicroF1_2 = extractMetric(results, 'microF1_2').reduce(ee.Reducer.mean());
+var meanMicroF1_3 = extractMetric(results, 'microF1_3').reduce(ee.Reducer.mean());
+
+print('Spatial CV Mean OA Scenario 2', meanOA2);
+print('Spatial CV Mean OA Scenario 3', meanOA3);
+print('Mean Macro-F1 Scenario 2:', meanMacroF1_2);
+print('Mean Macro-F1 Scenario 3:', meanMacroF1_3);
+print('Mean Micro-F1 Scenario 2:', meanMicroF1_2);
+print('Mean Micro-F1 Scenario 3:', meanMicroF1_3);
+
+
+//---------------------------- Per-Class F1 and Prevalance
+
+//=========================== For All Folds
+var perClassF1_2_all = extractMetric(results, 'perClassF1_2');
+var perClassF1_3_all = extractMetric(results, 'perClassF1_3');
+var prevalenceAll = extractMetric(results, 'prevalence');
+print('Per-Class F1 Scenario 2', perClassF1_2_all);
+print('Prevalenac', prevalenceAll);
+
+
+//============================ Means for Folds
+
+// ------------ Scenario 2
+var allF1Entries = perClassF1_2_all.flatten(); // List of dictionaries
+
+var classIndices = allF1Entries.map(function(d){
+  return ee.Number(ee.Dictionary(d).get('class')).format('%d');
+}).distinct();
+
+var meanF1_2 = classIndices.iterate(function(cls, acc){
+  acc = ee.Dictionary(acc);
+
+  var f1Values = allF1Entries.map(function(d){
+    d = ee.Dictionary(d);
+    return ee.Algorithms.If(
+      ee.String(ee.Number(d.get('class')).format('%d')).equals(cls),
+      ee.Number(d.get('F1')),
+      null
+    );
+  });
+
+  var cleanValues = ee.List(f1Values).removeAll([null]);
+  var meanF1 = ee.Algorithms.If(cleanValues.size().gt(0),
+    ee.Number(cleanValues.reduce(ee.Reducer.mean())),
+    ee.Number(0));
+
+  return acc.set(cls, meanF1);
+}, ee.Dictionary({}));
+
+print('✅ Mean Per-Class F1 (Scenario 2):', meanF1_2);
+
+
+//---------------- Scenario 3
+var allF1Entries3 = perClassF1_3_all.flatten(); 
+
+var classIndices3 = allF1Entries3.map(function(d){
+  return ee.Number(ee.Dictionary(d).get('class')).format('%d');
+}).distinct();
+
+var meanF1_3 = classIndices3.iterate(function(cls, acc){
+  acc = ee.Dictionary(acc);
+
+  var f1Values3 = allF1Entries3.map(function(d){
+    d = ee.Dictionary(d);
+    return ee.Algorithms.If(
+      ee.String(ee.Number(d.get('class')).format('%d')).equals(cls),
+      ee.Number(d.get('F1')),
+      null
+    );
+  });
+
+  var cleanValues3 = ee.List(f1Values3).removeAll([null]);
+  var meanF13 = ee.Algorithms.If(cleanValues3.size().gt(0),
+    ee.Number(cleanValues3.reduce(ee.Reducer.mean())),
+    ee.Number(0));
+
+  return acc.set(cls, meanF13);
+}, ee.Dictionary({}));
+
+print('✅ Mean Per-Class F1 (Scenario 3)', meanF1_3);
+
+
+
+//---------------- Mean Per-Class Prevalence
+// Get class labels from first fold
+var classKeys = ee.Dictionary(prevalenceAll.get(0)).keys();
+
+// Mean prevalence
+var meanPrevalence = ee.Dictionary.fromLists(
+  classKeys,
+  classKeys.map(function(cls){
+    var values = prevalenceAll.map(function(p){
+      return ee.Number(ee.Dictionary(p).get(cls));
+    });
+    return ee.Number(values.reduce(ee.Reducer.mean()));
+  })
+);
+
+print('📊 Mean Per-Class Prevalence:', meanPrevalence);
+*/
+
+
+
+
+/*
+// ==== For Above Method 1: ==================== Random Hold-Out Validation
+
+
+//============================================================================================================
+//                                   Defining A Model - Normal
+//============================================================================================================
+print('🟢 Classifiers For Model Scenario')
+
+// Train RF using best RF from Spatial CN: check if var bestParams = ee.Dictionary(ee.Dictionary(tuningResults.get(1)).get('params'));
+
+//--------//████████████████████-------select bestParams or individual params
+var bestParamsM = ee.Dictionary(bestParams);   // if 'params' was selected
+var bestParamsC2 = ee.Dictionary(bestParams2);
+var bestParamsC3 = ee.Dictionary(bestParams3);
+
+
+
+// Scenario 2
+ var trnClassifier2 = ee.Classifier.smileRandomForest({
+    numberOfTrees: bestParamsC2.get('ntrees'),
+    variablesPerSplit: bestParamsC2.get('mtry'),
+    minLeafPopulation: bestParamsC2.get('minLeaf'),
+    maxNodes: bestParamsC2.get('maxNodes'),
+    bagFraction: bestParamsC2.get('bag'),
+    seed: bestParamsC2.get('seed')
+  }).train({
+    features: trainRandom,
+    classProperty: 'class',
+    inputProperties: inputProps2
+  });
+
+// Scenario 3
+ var trnClassifier3 = ee.Classifier.smileRandomForest({
+    numberOfTrees: bestParamsC3.get('ntrees'),
+    variablesPerSplit: bestParamsC3.get('mtry'),
+    minLeafPopulation: bestParamsC3.get('minLeaf'),
+    maxNodes: bestParamsC3.get('maxNodes'),
+    bagFraction: bestParamsC3.get('bag'),
+    seed: bestParamsC3.get('seed'),
+  }).train({
+    features: trainRandom,
+    classProperty: 'class',
+    inputProperties: inputProps3
+  });
+
+*/
+/*
+// Information about classifier
+print('Classifier 2', trnClassifier2);
+print('Classifier 3', trnClassifier3);
+
+
+//============================================================================================================
+print('🟢 Training Assessment')
+
+// Get information about the trained classifier | Vriable importance
+print('Results of trained classifier 2', trnClassifier2.explain());
+print('Results of trained classifier 3', trnClassifier3.explain());
+//print(trnClassifier2.explain(), 'Feature Importance 2');
+//print(trnClassifier3.explain(), 'Feature Importance 3');
+
+
+// Accuracy for the training sample.
+//var trainAccuracy2 = trnClassifier2.confusionMatrix();
+//var trainAccuracy3 = trnClassifier3.confusionMatrix();
+
+//print('Training OA 2', trainAccuracy2.accuracy());
+//print('Training OA 3', trainAccuracy3.accuracy());
+
+//print('Training Error matrix', trainAccuracy);
+//print('Training Overall accuracy', trainAccuracy.accuracy());
+//print('Training Kappa: = ', trainAccuracy.kappa());
+//print('Training Producers accuracy: =', trainAccuracy.producersAccuracy()); // recall
+//print('Training Users accuracy: = ', trainAccuracy.consumersAccuracy());    // precision
+
+
+//============================================================================================================
+//                                           Classify and test with test data.
+//============================================================================================================
+
+// Test Model with 20% Validation Set
+var valSample2 = testRandom.classify(trnClassifier2);
+var valSample3 = testRandom.classify(trnClassifier3);
+
+var testAccuracy2 = valSample2.errorMatrix('class', 'classification');
+var testAccuracy3 = valSample3.errorMatrix('class', 'classification');
+
+print('Validation Confusion Matrix: ', testAccuracy2);
+print('Validation Confusion Matrix: ', testAccuracy3);
+
+print('🎯 Overal Accuracy Measure')
+print('Validation OA 2: ', testAccuracy2.accuracy());
+print('Validation OA 3: ', testAccuracy3.accuracy());
+
+//print('Validation Kappa: = ', testAccuracy.kappa());
+print('🎯 Producers Accuracy Measure')
+print('Validation PA 2: =', testAccuracy2.producersAccuracy()); // recall/sensitivity
+print('Validation PA 3: =', testAccuracy3.producersAccuracy());
+
+print('🎯 Users / Consumer Accuracy Measure')
+print('Validation UA 2: = ', testAccuracy2.consumersAccuracy()); //Precision/user accuracy
+print('Validation UA 3: = ', testAccuracy3.consumersAccuracy());
+
+
+//---- F1 score
+var macroF1_2_random = computeF1(testAccuracy2).get('macroF1');
+var macroF1_3_random  = computeF1(testAccuracy3).get('macroF1');
+
+var microF1_2_random = computeF1(testAccuracy2).get('microF1');
+var microF1_3_random = computeF1(testAccuracy3).get('microF1');
+
+print('Random Hold-Out F1 Macro Scenario 2', macroF1_2_random);
+print('Random Hold-Out F1 Macro Scenario 3', macroF1_3_random);
+print('Random Hold-Out F1 Micro Scenario 2', microF1_2_random);
+print('Random Hold-Out F1 Micro Scenario 3', microF1_3_random);
+
+
+//========================= Random Split Against Spatial Cross Validation=======================================
+
+//---------------------------- Deltas --- Quantify Spatial leakage
+
+//print('OA Delta Scenario 2', testAccuracy2.accuracy().subtract(meanOA2));
+
+var deltaOA2 = ee.Number(meanOA2).subtract(testAccuracy2.accuracy());
+var deltaMacroF1_2 = ee.Number(meanMacroF1_2).subtract(ee.Number(computeF1(testAccuracy2).get('macroF1')));
+var deltaMicroF1_2 = ee.Number(meanMicroF1_2).subtract(ee.Number(computeF1(testAccuracy2).get('microF1')));
+
+var deltaOA3 = ee.Number(meanOA3).subtract(testAccuracy3.accuracy());
+var deltaMacroF1_3 = ee.Number(meanMacroF1_3).subtract(ee.Number(computeF1(testAccuracy3).get('macroF1')));
+var deltaMicroF1_3 = ee.Number(meanMicroF1_3).subtract(ee.Number(computeF1(testAccuracy3).get('microF1')));
+
+
+print('🔄 OA Delta (SCV - Random) Scenario 2:', deltaOA2);
+print('🔄 Macro F1 Delta Scenario 2:', deltaMacroF1_2);
+print('🔄 Micro F1 Delta Scenario 2:', deltaMicroF1_2);
+
+print('🔄 OA Delta (SCV - Random) Scenario 3:', deltaOA3);
+print('🔄 Macro F1 Delta Scenario 3:', deltaMacroF1_3);
+print('🔄 Micro F1 Delta Scenario 3:', deltaMicroF1_3);
+
+*/
+
+
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+//████████████████████ --------- Train Classifiers from Folds and Tuning or use randomSpli
+
+//var finalClassifier2 = trnClassifier2;
+//var finalClassifier3 = trnClassifier3;
+
+//=============================================================================================================
+//                              Train a Final Model: Using Folds and Tuning Approach
+//=============================================================================================================
+
+// Using Spatial hold-out for validation
+///var testFold = 0;  // or any fold index
+//var trainSet = clusteredSamples.filter(ee.Filter.neq('fold', testFold));
+//var testSet = clusteredSamples.filter(ee.Filter.eq('fold', testFold));
+
+var inputProps2 = ['Blue',  'Red', 'NIR', 'SWIR1', 
+  'NDWI', 'MNDWI', 'WRI', 'NDVI', 'NDBI',   'AWEI_nsh', 'NDMI'];
+
+var inputProps3 = inputProps2.concat([
+  'Elevation', 'Slope', 'Aspect', 'TPI',
+  'Distance from Water', 'Distance from Rivers',
+  'Distance from Road', 'Distance from RailStation',
+  'Distance from Town', 'GHSL Built-up', 'K-Means'
+]);
+//████████████████████ -------- use  features: clusteredSamples, or above
+
+var bestParamsC2 = ee.Dictionary({
+    numberOfTrees: 150,
+    variablesPerSplit: 4,
+    minLeafPopulation: 1,
+    maxNodes: 500,
+    bagFraction: 0.6,
+    seed: 7
+  })
+
+// Model Index 3
+var bestParamsC3 = bestParamsC2
+
+
+
+// Scenario 2
+ var finalClassifier2 = ee.Classifier.smileRandomForest({
+    numberOfTrees: 150,
+    variablesPerSplit: 4,
+    minLeafPopulation: 1,
+    maxNodes: 500,
+    bagFraction: 0.6,
+    seed: 7
+  }).train({
+    features: trainRandom,
+    classProperty: 'class',
+    inputProperties: inputProps2
+  });
+
+// Scenario 3
+ var finalClassifier3 = ee.Classifier.smileRandomForest({
+    numberOfTrees: 150,
+    variablesPerSplit: 4,
+    minLeafPopulation: 1,
+    maxNodes: 500,
+    bagFraction: 0.6,
+    seed: 7
+  }).train({
+    features: trainRandom,
+    classProperty: 'class',
+    inputProperties: inputProps3
+  });
+
+//print('Final trained classifier 2', finalClassifier2.explain());
+//print('Final trained classifier 3', finalClassifier3.explain());
+
+
+
+
+//==================================== Classify Image Scenarion===============================================
+
+print('🟢 Classify Image Scenarios')
+var classifiedSc2 = combinedImage.classify(finalClassifier2);
+var classifiedSc3 = combinedImage.classify(finalClassifier3);
+
+
+Map.addLayer(classifiedSc2, landCoverPalette, 'Classified Sc 2 ', false);
+Map.addLayer(classifiedSc3, landCoverPalette, 'Classified Sc 3 ', false);
+
+
+//============================================================================================================
+//                                          Comparison with SANLC and GLOBAL LULC
+//============================================================================================================
+
+//================================== USING INPUT RECLASS RASTERS ==============================================
+var classifiedMap3 = classifiedSc3.select('classification')//.reproject({crs: 'EPSG:4326', scale: 30});
+var classifiedMap2 = classifiedSc2.select('classification')
+var sanlcMap = nmbNlc_20Reclas.select('b1').rename('classification')               
+var globalMap = esriNmb_2020.select('b1').rename('classification') // or 'remapped'
+
+
+
+//============================================================================================================
+//                                          Statistics
+//============================================================================================================
+
+print('📊 Statistics and Calculations')
+
+
+//                                        For Multiple Classifications (Rasters)
+
+// Function to compute area per class for a given classified image
+function calculateAreaPerClass(classifiedImage, imageName, AOI, scale) {
+  var areaImage = ee.Image.pixelArea().addBands(classifiedImage).divide(1e6); // Area in km²
+
+  var areaByClass = areaImage.reduceRegion({
+    reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'class'
+    }),
+    geometry: AOI,
+    scale: scale,
+    bestEffort: true,
+    maxPixels: 1e13
+  });
+
+  var areaList = ee.List(areaByClass.get('groups'));
+
+  var areaTable = ee.FeatureCollection(areaList.map(function(item) {
+    var dict = ee.Dictionary(item);
+    return ee.Feature(null, {
+      class: dict.get('class'),
+      area_km2: dict.get('sum'),
+      source: imageName
+    });
+  }));
+
+  //print(imageName + " Class Area Table (km²):", areaTable);
+  return areaTable;
+}
+
+// Apply Function for Areas
+var areaTableSc2 = calculateAreaPerClass(classifiedSc2, 'ClassifiedSc2', AOI, 10);
+var areaTableSc3 = calculateAreaPerClass(classifiedSc3, 'ClassifiedSc3', AOI, 10);
+var areaTableSANLC = calculateAreaPerClass(sanlcMap, 'SANLC', AOI, 10);
+var areaTableESRI = calculateAreaPerClass(globalMap, 'ESRI LULC', AOI, 10); // or JRC LULC - nmbGobal_20Reclas
+
+// Export to CSV
+
+// Combin eall into one
+var allTables = areaTableSc3.merge(areaTableSc2).merge(areaTableSANLC).merge(areaTableESRI);
+//print("Combined Area Table:", allTables);
+
+Export.table.toDrive({
+  collection: allTables,
+  folder: 'LULC_ClassificationApproach',
+  description: 'AreaPerClass_AllMaps_nmb_Latest',
+  fileFormat: 'CSV'
+});
+
+
+
+//============================================================================================================
+
+// Bar Chart
+/*
+// Classification 2
+var chartB2 = ui.Chart.image.byClass({
+  image : ee.Image.pixelArea().addBands(classifiedSc2).divide(1e6),
+  classBand: 'classification',
+  region: AOI, 
+  reducer: ee.Reducer.sum(),
+  scale : 30,
+
+ }).setSeriesNames(ee.List(['Water', 'Forest', 'Built_up', 'Cropland', 'Barren', 'Grassland', 'wetland'])).setOptions({
+    title: 'Scenario 2: Area for Each Land Cover Class',
+    hAxis: {title: 'LuLc by Class',  titleTextStyle: {color: '#333'}},
+    vAxis:{title : 'Area (sq. km)'},
+    colors:[
+        '0000FF', 
+        '006400',
+        '#fa0000', 
+        '#06cd28',
+        '#9ea3a1', 
+        '#ffff4c',
+        '#0096a0',
+        //'black'
+      ]
+  });
+print(chartB2)
+
+// Classification 3
+var chartB3 = ui.Chart.image.byClass({
+  image : ee.Image.pixelArea().addBands(classifiedSc3).divide(1e6),
+  classBand: 'classification',
+  region: AOI, 
+  reducer: ee.Reducer.sum(),
+  scale : 30,
+
+ }).setSeriesNames(ee.List(['Water', 'Forest', 'Built_up', 'Cropland', 'Barren', 'Grassland', 'wetland'])).setOptions({
+    title: 'Scenario 3: Area for Each Land Cover Class',
+    hAxis: {title: 'LuLc by Class',  titleTextStyle: {color: '#333'}},
+    vAxis:{title : 'Area (sq. km)'},
+    colors:[
+        '0000FF', 
+        '006400',
+        '#fa0000', 
+        '#06cd28',
+        '#9ea3a1', 
+        '#ffff4c',
+        '#0096a0',
+        //'black'
+      ]
+  });
+print(chartB3)
+
+*/
+
+
+
+//============================================================================================================
+print('📊 Comapring My Classification Scenarios');
+
+
+
+//================================== BETWEEN CLASSIFICATION 3 AND 2 ===========================================
+/*
+//                                             Binary agreemtn
+//  0 no-match and 1 match
+var agree32 = classifiedSc2.eq(classifiedSc3).int();
+Map.addLayer(agree32, {min: 0, max: 1, palette: ['red', 'green']}, 'Agreement Classified: 3 and 2', false);
+
+
+//                                        Pixel Wise Agreement OA
+
+// Count of agreeing pixels
+var correctPixels32 = agree32.reduceRegion({
+  reducer: ee.Reducer.sum(),
+  geometry: AOI,          
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// Total number of pixels
+var totalPixels32 = agree32.reduceRegion({
+  reducer: ee.Reducer.count(),
+  geometry: AOI,
+  scale: 10,
+  maxPixels: 1e13
+});
+
+// Overall accuracy calculation
+var accuracy32 = ee.Number(correctPixels32.values().get(0))
+        .divide(ee.Number(totalPixels32.values().get(0)))
+        .multiply(100);
+
+print('OA {Pixel Wise} (%): Agreement Between Classified: 3 and 2:', accuracy32);
+
+*/
+
+
+
+//============================================================================================================
+//                                          Comparison with SANLC and GLOBAL LULC
+//============================================================================================================
+print('📊 Comaparing Best Performed SC 3) with SANLC Classification')
+
+
+
+//print(classifiedSc3)
+//print(dbn_SANLC) 
+
+
+//============================================================================================================
+
+//Using = classifiedMap; classifiedMap2; sanlcMap; globalMap
+
+
+// Using derived points or can generate random
+//var postValPoint = water20.merge(forest20).merge(built_up20).merge(cropland20).merge(barren20).merge(grassland20).merge(wetland20)
+                  //.map(addCoordinates); // Previously defined
+
+// Or Using 30 to test
+var postValPoint = testRandom.map(addCoordinates)
+
+
+//============== USING FUNCTION
+
+// Sample classified and simulated values
+var validationPoints = postValPoint.map(function(pt) {
+  var classified2Point = classifiedMap2.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: pt.geometry(),
+    scale: 10
+  }).get('classification');
+
+  var classified3Point = classifiedMap3.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: pt.geometry(),
+    scale: 10
+  }).get('classification');
+  
+  var sanlcPoint = sanlcMap.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: pt.geometry(),
+    scale: 10
+  }).get('classification');
+
+  var globalPoint = globalMap.reduceRegion({
+    reducer: ee.Reducer.first(),
+    geometry: pt.geometry(),
+    scale: 10
+  }).get('classification');
+  
+  return pt.set({'Classified2': classified2Point, 'Classified3': classified3Point, 'sanlc': sanlcPoint, 'global': globalPoint});
+});
+
+// Filter valid samples
+var validPoints = validationPoints.filter(ee.Filter.notNull(['Classified2', 'Classified3', 'sanlc', 'global']));
+//print('Post Validation Points:', validPoints.size());
+//print('Post-Val Points:', validPoints);
+
+/*
+// Confusion matrix and basic metrics
+  // Using Post-Validation Class against models 
+var postValCmClass2 = validPoints.errorMatrix('class', 'Classified2');
+var postValCmClass3 = validPoints.errorMatrix( 'class','Classified3');
+  // Using Post-Val data compare against classifictaions
+var emClass3_Class2 = validPoints.errorMatrix('Classified3', 'Classified2');
+var emSanlc_Global = validPoints.errorMatrix('sanlc', 'global');
+var emClass2_sanlc = validPoints.errorMatrix('sanlc', 'Classified2');
+var emClass3_sanlc = validPoints.errorMatrix('sanlc', 'Classified3');
+var emClass2_global = validPoints.errorMatrix('global', 'Classified2');
+var emClass3_global = validPoints.errorMatrix('global', 'Classified3');
+
+
+print('🎯 Our Classification Post-Validation Performance')
+print('Post-Val: OA - Class 2', postValCmClass2.accuracy());
+print('Post-Val: OA - Class 3', postValCmClass3.accuracy());
+print('Post-Val: PA - Class 2', postValCmClass2.producersAccuracy());
+print('Post-Val: PA - Class 3', postValCmClass3.producersAccuracy());
+print('Post-Val: UA - Class 2', postValCmClass2.consumersAccuracy());
+print('Post-Val: UA - Class 3', postValCmClass3.consumersAccuracy());
+
+// For Clasification 2 and 3 Omission and Commision
+// Omission Error = 1 - Producer's Accuracy
+// Commission Error = 1 - User's Accuracy
+
+
+print('Conf. Matrix (Post-Val Classification 2):', postValCmClass2);
+print('Conf. Matrix (Post-Val Classification 3):', postValCmClass3);
+*/
+
+
+print('🎯 Validation Against Classified and SANLC, GLOBAL')
+//print('OA: Class 3 - Class 2', emClass3_Class2.accuracy());
+//print('OA: SANLC - GLOBAL', emSanlc_Global.accuracy());
+//print('OA: Class 2 - SANLC', emClass2_sanlc.accuracy());
+//print('OA: Class 3 - SANLC', emClass3_sanlc.accuracy());
+//print('OA: Class 2 - GLOBAL', emClass2_global.accuracy());
+//print('OA: Class 3 - GLOBAL', emClass3_global .accuracy());
+
+
+/*
+Export.table.toDrive({
+  collection: validPoints,
+  description: 'PostValPoints_30p_classificationsComparisons_nmb',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV',
+  selectors: ['longitude', 'latitude', 'class','Classified2', 'Classified3', 'sanlc', 'global']  // Add other properties if needed
+});
+*/
+
+//                              Function to compute F1-score per class (Post-Validation)
+//============================================================================================================
+// Recall -> Producers 
+// Precision -> Users
+// F-Score -> 2* (Precision*Recall)/(Precision+Recall)
+
+
+
+//============================================================================================================
+//                              Validation Map
+//============================================================================================================
+
+// Add a property to show misclassification
+/*
+// Classification 2
+var errorFlaggedCla2 = validPoints.map(function(f){
+  var trueClassCla2 = f.get('class');
+  var predictedCla2 = f.get('Classified2');
+  var errorCla2 = ee.Number(trueClassCla2).neq(predictedCla2);
+  return f.set('error2', errorCla2);
+});
+
+// Classification 3
+var errorFlaggedCla3 = validPoints.map(function(f){
+  var trueClassCla3 = f.get('class');
+  var predictedCla3 = f.get('Classified3');
+  var errorCla3 = ee.Number(trueClassCla3).neq(predictedCla3);
+  return f.set('error3', errorCla3);
+});
+
+Map.addLayer(errorFlaggedCla2.filter(ee.Filter.eq('error2', 1)), {color: 'red'}, 'Misclassified Points - Classification 2', false);
+Map.addLayer(errorFlaggedCla2.filter(ee.Filter.eq('error2', 0)), {color: 'green'}, 'Correctly Classified - Classification 2', false);
+Map.addLayer(errorFlaggedCla3.filter(ee.Filter.eq('error3', 1)), {color: 'red'}, 'Misclassified Points - Classification 3', false);
+Map.addLayer(errorFlaggedCla3.filter(ee.Filter.eq('error3', 0)), {color: 'green'}, 'Correctly Classified - Classification 3', false);
+*/
+
+// Combine Error Flagged
+// Add both error flags to the same feature
+
+var combinedErrorFlags = validPoints.map(function(f){
+  var trueClass = f.get('class');
+  var pred2 = f.get('Classified2');
+  var pred3 = f.get('Classified3');
+ 
+
+  var error2 = ee.Number(trueClass).neq(pred2);
+  var error3 = ee.Number(trueClass).neq(pred3);
+
+  return f.set({
+    'error2': error2,
+    'error3': error3,
+    'trueClass': trueClass,
+    'predicted2': pred2,
+    'predicted3': pred3,
+   
+  });
+});
+
+
+Export.table.toDrive({
+  collection: combinedErrorFlags,
+  description: 'PostValPoints_30p_ErrorFlaged_nmb_Oct_Latest',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV'
+});
+
+
+//Map.addLayer(bothErrors, {color: 'orange'}, 'Errors in Both Classifiers', false);
+
+
+
+//============================================================================================================
+
+//============================================================================================================
+
+
+
+
+// Define the export region and scale
+var exportRegion = AOI; 
+var scale = 10;
+
+// Create a dictionary of indices
+var indices = {
+  //'SANLC_2020': sa_nlc_2020,
+  //'NDWI': NDWI,
+  //'MNDWI': MNDWI,
+  //'WRI': WRI,
+  //'NDVI': NDVI,
+  //'IBI': IBI,
+  //'NDBI': NDBI,
+  //'NDMI': NDMI,
+  //'BSI': BSI,
+  //'EVI': EVI,
+  //'AWEI_nsh': AWEI_nsh,
+  //'dem_srtm_nmb': srtm,
+  //'elevation_srtm_nmb': elevationSRTM,
+  //'slope_srtm_nmb': slopeSRTM,
+  //'aspect_srtm_nmb': aspectSRTM,
+  //'Built_up_nmb': builtUp,
+  //'SANLC_2020_nmb': nmb_SANLC,
+  //'ESRI_LULC_nmb': esriNmb_2020,
+  //'ClasifiedSc1_band_nmb': classifiedSc1,
+  'ClasifiedSc2_indice_nmb_Latest': classifiedSc2,
+  'ClasifiedSc3_auxiliary_nmb_Latest': classifiedSc3,
+  //'Agreement_Classified_3_2_nmb': agree32
+};
+
+// Helper function to create export tasks
+Object.keys(indices).forEach(function(key) {
+  Export.image.toDrive({
+    image: indices[key],
+    description: 'nmb_' + key,
+    folder: 'LULC_ClassificationApproach_Revised',
+    fileNamePrefix: key,
+    region: exportRegion,
+    scale: scale,
+    crs: 'EPSG:4326',
+    maxPixels: 1e13
+  });
+});
+
+
+//                                          Transition
+//============================================================================================================
+print('🎯 Metrix For Pontious Calculations');
+ 
+var classList = [0, 1, 2, 3, 4, 5, 6]
+
+//=================================== Using Function
+/*
+function computeTransitionMatrix(refMap, predMap, refName, predName) {
+  var transition = refMap.multiply(10).add(predMap);
+
+  var matrix = classList.map(function(refClass) {
+    return classList.map(function(predClass) {
+      var code = ee.Number(refClass).multiply(10).add(predClass);
+      var count = transition.eq(code).reduceRegion({
+        reducer: ee.Reducer.sum(),
+        geometry: AOI,
+        scale: 10,
+        maxPixels: 1e13
+      }).values().get(0);
+      return ee.Number(count);
+    });
+  });
+
+  // Wrap in ee.List(...).evaluate(...)
+  ee.List(matrix).evaluate(function(result) {
+   print('Transition Matrix: ' + refName + ' vs ' + predName, result);
+
+    // Build exportable feature collection
+    var features = ee.FeatureCollection(ee.List(result).map(function(row, i) {
+      return ee.Feature(null, ee.Dictionary.fromLists(
+        classList.map(function(j) { return ee.String('class_').cat(ee.Number(j).format()); }),
+        ee.List(row)
+      )).set('reference_class', i);
+    }));
+
+    // Export
+    Export.table.toDrive({
+      collection: features,
+      description: 'TransitionMatrix_' + refName + '_vs_' + predName,
+      fileFormat: 'CSV'
+    });
+    
+  });
+}
+
+
+// Call the function
+computeTransitionMatrix(sanlcMap, classifiedMap2, 'SANLC', 'Scenario1');
+computeTransitionMatrix(globalMap, classifiedMap2, 'ESRI', 'Scenario1');
+computeTransitionMatrix(sanlcMap, classifiedMap3, 'SANLC', 'Scenario2');
+computeTransitionMatrix(globalMap, classifiedMap3, 'ESRI', 'Scenario2');
+*/
+
+
+//=================================== Per Each Comparison: Manual Computing
+// 0. Scenario 1 vs Scenario2
+
+var transition0 = classifiedMap2.multiply(10).add(classifiedMap3);
+var matrix0 = classList.map(function(refClass) {
+  return classList.map(function(predClass) {
+    var code = ee.Number(refClass).multiply(10).add(predClass);
+    var dict = transition0.eq(code).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: AOI,
+      scale: 10,
+      maxPixels: 1e13
+    });
+    var countRaw = dict.values().get(0);
+    var count = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(countRaw, null),
+      0,
+      ee.Number(countRaw)
+    );
+    return count;
+  });
+});
+
+// Create feature collection
+var featureCollection0 = ee.FeatureCollection(
+  matrix0.map(function(row, i) {
+    return ee.Feature(null, ee.Dictionary.fromLists(
+      classList.map(function(j) {
+        return ee.String('class_').cat(ee.Number(j).format()); 
+      }),
+      ee.List(row)
+    )).set('reference_class', i);
+  })
+);
+
+// Export
+Export.table.toDrive({
+  collection: featureCollection0,
+  description: 'nmb_TransitionMatrix_Scenario2_Sce_3_Latest',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV'
+});
+/*
+
+// 1. SANLC vs Scenario1
+// Example: SANLC vs Scenario1
+var transition = sanlcMap.multiply(10).add(classifiedMap2);
+var matrix = classList.map(function(refClass) {
+  return classList.map(function(predClass) {
+    var code = ee.Number(refClass).multiply(10).add(predClass);
+    var dict = transition.eq(code).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: AOI,
+      scale: 10,
+      maxPixels: 1e13
+    });
+    var countRaw = dict.values().get(0);
+    var count = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(countRaw, null),
+      0,
+      ee.Number(countRaw)
+    );
+    return count;
+  });
+});
+
+// Create feature collection
+var featureCollection1 = ee.FeatureCollection(
+  matrix.map(function(row, i) {
+    return ee.Feature(null, ee.Dictionary.fromLists(
+      classList.map(function(j) {
+        return ee.String('class_').cat(ee.Number(j).format()); 
+      }),
+      ee.List(row)
+    )).set('reference_class', i);
+  })
+);
+
+// Export
+Export.table.toDrive({
+  collection: featureCollection1,
+  description: 'nmb_TransitionMatrix_SANLC_vs_Scenario2_Latest',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV'
+});
+
+//=================================== 
+// 2. ESRI (global) vs Scenario1
+// 
+var transition = globalMap.multiply(10).add(classifiedMap2);
+var matrix = classList.map(function(refClass) {
+  return classList.map(function(predClass) {
+    var code = ee.Number(refClass).multiply(10).add(predClass);
+    var dict = transition.eq(code).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: AOI,
+      scale: 10,
+      maxPixels: 1e13
+    });
+    var countRaw = dict.values().get(0);
+    var count = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(countRaw, null),
+      0,
+      ee.Number(countRaw)
+    );
+    return count;
+  });
+});
+
+// Create feature collection
+var featureCollection2 = ee.FeatureCollection(
+  matrix.map(function(row, i) {
+    return ee.Feature(null, ee.Dictionary.fromLists(
+      classList.map(function(j) {
+      return ee.String('class_').cat(ee.Number(j).format()); 
+     }),
+     ee.List(row)
+    )).set('reference_class', i);
+  })
+);
+
+// Export
+Export.table.toDrive({
+  collection: featureCollection2,
+  description: 'nmb_TransitionMatrix_ESRI_vs_Scenario2_Latest',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV'
+});
+*/
+//=================================== 
+// 3. SANLC vs Scenario2
+// Example: SANLC vs Scenario2
+var transition = sanlcMap.multiply(10).add(classifiedMap3);
+var matrix = classList.map(function(refClass) {
+  return classList.map(function(predClass) {
+    var code = ee.Number(refClass).multiply(10).add(predClass);
+    var dict = transition.eq(code).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: AOI,
+      scale: 10,
+      maxPixels: 1e13
+    });
+    var countRaw = dict.values().get(0);
+    var count = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(countRaw, null),
+      0,
+      ee.Number(countRaw)
+    );
+    return count;
+  });
+});
+
+// Create feature collection
+var featureCollection3 = ee.FeatureCollection(
+  matrix.map(function(row, i) {
+    return ee.Feature(null, ee.Dictionary.fromLists(
+      classList.map(function(j) {
+        return ee.String('class_').cat(ee.Number(j).format()); 
+      }),
+      ee.List(row)
+    )).set('reference_class', i);
+  })
+);
+
+
+// Export
+Export.table.toDrive({
+  collection: featureCollection3,
+  description: 'nmb_TransitionMatrix_SANLC_vs_Scenario3_Latest',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV'
+});
+
+print('TransitionMatrix_SANLC_vs_Scenario3', featureCollection3)
+//=================================== 
+// 4. ESRI (global) vs Scenario2
+// 
+var transition = globalMap.multiply(10).add(classifiedMap3);
+var matrix = classList.map(function(refClass) {
+  return classList.map(function(predClass) {
+    var code = ee.Number(refClass).multiply(10).add(predClass);
+    var dict = transition.eq(code).reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: AOI,
+      scale: 10,
+      maxPixels: 1e13
+    });
+    var countRaw = dict.values().get(0);
+    var count = ee.Algorithms.If(
+      ee.Algorithms.IsEqual(countRaw, null),
+      0,
+      ee.Number(countRaw)
+    );
+    return count;
+  });
+});
+
+// Create feature collection
+var featureCollection4 = ee.FeatureCollection(
+  matrix.map(function(row, i) {
+    return ee.Feature(null, ee.Dictionary.fromLists(
+      classList.map(function(j) {
+       return ee.String('class_').cat(ee.Number(j).format()); 
+      }),
+      ee.List(row)
+    )).set('reference_class', i);
+  })
+);
+
+// Export
+Export.table.toDrive({
+  collection: featureCollection4,
+  description: 'nmb_TransitionMatrix_ESRI_vs_Scenario3_Latest',
+  folder: 'LULC_ClassificationApproach_Revised',
+  fileFormat: 'CSV'
+});
+
+print('TransitionMatrix_ESRI_vs_Scenario3', featureCollection4)
+
+//=================================== Manual Computing
+
+// Tracking a specific transition - multiplying with 100 and add image
+//var tranSanlc_ClassMap2 =  classifiedMap2.multiply(10).add(sanlcMap).rename('transitionsSANLC_ClassMap2') 
+//print(tranSanlc_ClassMap2, 'Transition SANLC- ClassifiedMap2');
+
+// Using frequency histogram to get a pixel count per class
+//var transitionMatrix_sanlc_classMap2 = tranSanlc_ClassMap2.reduceRegion({
+  //reducer:ee.Reducer.frequencyHistogram(),
+  //geometry: AOI,
+  //maxPixels:1e10,
+  //scale: 10
+//});
+
+// Print number of pixels per each class
+//print('Transition 2003 - 2013 Class to Class', transitionMatrix_sanlc_classMap2.get('transitionsSANLC_ClassMap2'));
+
+
+
+END
+
+
+//============================================================================================================
+//                                                 Legend and Title Map
+//============================================================================================================
+
+
+// Add a map title
+var title = ui.Label({
+  value: 'Land Use and Land Cover (LULC) Classification',
+  style: {fontSize: '20px', fontWeight: 'bold', textAlign: 'center', stretch: 'horizontal'}
+});
+Map.add(title);
+
+// Define the legend panel
+var legend = ui.Panel({
+  style: {
+    position: 'bottom-left',
+    padding: '8px'
+  }
+});
+
+// Create a title for the legend
+var legendTitle = ui.Label({
+  value: 'LULC',
+  style: {
+    fontWeight: 'bold',
+    fontSize: '18px',
+    margin: '0 0 4px 0',
+    padding: '0'
+  }
+});
+
+// Add the title to the legend
+legend.add(legendTitle);
+
+// Function to create a row in the legend
+var makeRow = function(color, name) {
+  // Create a coloured box representing the hazard index class
+  var colorBox = ui.Label({
+    style: {
+      backgroundColor: color,
+      padding: '8px',
+      margin: '0 0 4px 0'
+    }
+  });
+
+  // Create a label for the hazard index class name
+  var description = ui.Label({
+    value: name,
+    style: {margin: '0 0 4px 6px'}
+  });
+
+  // Return a panel containing the coloured box and the label
+  return ui.Panel({
+    widgets: [colorBox, description],
+    layout: ui.Panel.Layout.Flow('horizontal')
+  });
+};
+
+// Define SPI class names and colours
+var classList = ['Water', 'Forest', 'Built_up',  'Cropland', 'Barren', 'Grassland', 'Wetland'];
+var classColors = [
+        '0000FF', 
+        '006400',
+        '#fa0000', 
+         '#06cd28',
+         '#9ea3a1', 
+        '#ffff4c',
+        '#0096a0',
+        //'black'
+      ];
+
+// Loop through the SPI class names and colours to create legend rows 
+for (var i = 0; i < classList.length; i++) {
+  legend.add(makeRow(classColors[i], classList[i]));
+}
+
+// Add the legend to the map
+Map.add(legend);
